@@ -6,7 +6,6 @@ extern crate quote;
 extern crate syn;
 
 use proc_macro::TokenStream as TStream;
-use std::fmt::Write;
 
 use proc_macro2::{TokenStream, Span};
 use quote::{quote, quote_spanned, ToTokens};
@@ -18,111 +17,117 @@ use syn::synom::{Parser, Synom};
 pub fn def_mod(tokens: TStream) -> TStream {
 	let t = ModuleDecl::parse_all;
 	let declarations: Vec<ModuleDecl> = t.parse(tokens).unwrap();
-	let mut output = TokenStream::new();
-	for module in declarations {
-		let module_name = module.ident.clone();
 
-		if module.attrs.is_empty() {
+	let mut output = TokenStream::new();
+
+	for module in declarations {
+		let module_name = module.ident;
+
+		let mut pathed_attrs = vec![];
+		let mut custom_attrs = vec![];
+		// Group the attributes by their "exclusivity" factor.
+		for attr in module.attrs {
+			if let (attr, Some(path)) = attr {
+				pathed_attrs.push((attr, path));
+			} else {
+				custom_attrs.push(attr.0);
+			};
+		}
+		// Ghost the attr vectors, so no one can change them...
+		let pathed_attrs = &pathed_attrs;
+		let custom_attrs = &custom_attrs;
+
+		if pathed_attrs.is_empty() {
 			let vis = &module.vis;
 			let t = quote_spanned! { module_name.span() =>
+				#(#custom_attrs)*
 				#vis mod #module_name;
 			};
 			t.to_tokens(&mut output);
 		} else {
-			for attr in module.attrs {
-				let meta = attr.interpret_meta()
-					.expect("Invalid meta item :: must be of form #[os = \"path\"] :: not valid");
-				let meta_name_value = match meta {
-					Meta::NameValue(v) => v,
-					_ => panic!("Invalid meta item :: mut be of form #[os = \"path\"] :: not a name value"),
-				};
-				let os = {
-					let os_name = meta_name_value.ident;
-					format!("{}", os_name)
-				};
-
-				let path = {
-					let segment = match meta_name_value.lit {
-						Lit::Str(v) => v.value(),
-						_ => panic!("Invalid meta item :: mut be of form #[os = \"path\"] :: not a literal"),
-					};
-
-					if segment.starts_with("~") {
-						let mut path = String::new();
-						write!(path, "{}", module_name).unwrap();
-						path.push('/');
-						path.push_str(&segment[1..]);
-						path.push_str("/mod.rs");
-						path
-					} else {
-						segment
-					}
-				};
-
+			for (attr, path) in pathed_attrs {
 				let vis = &module.vis;
 				let t = quote_spanned! { module_name.span() =>
-					#[cfg(target_os = #os)]
+					#attr
 					#[path=#path]
+					#(#custom_attrs)*
 					#vis mod #module_name;
 				};
 				t.to_tokens(&mut output);
 			}
 		}
 
-		let name = format!("__load_{}", module_name);
-		let load_name = Ident::new(&name, Span::call_site());
+		// Generate a load function, if the module declared some items.
+		if let ModuleBody::Content((_brace, body)) = module.body {
+			let mut items: Vec<TokenStream> = vec![];
 
-		let mut index: u32 = 0;
-		let mut tokenise_method_item = |context: &Ident, method_item: TraitItemMethod| {
-			let load_name = format!("_ASSERT_METHOD_{}", index);
-			index += 1;
-			let load_ident = Ident::new(&load_name, Span::call_site());
-			let (ty, path) = convert(context, method_item.sig);
-			quote! {
-				const #load_ident: #ty = #path;
-			}
-		};
-
-		let mut items: Vec<TokenStream> = vec![];
-		for item in module.body {
-			items.push(match item {
-				DeclItem::Method(method_item) => tokenise_method_item(&module_name, method_item),
-				DeclItem::Type(type_item) => {
-					let type_name = type_item.ident;
-
-					let mut method_items = vec![];
-					for method_item in type_item.body {
-						method_items.push(tokenise_method_item(&type_name, method_item));
-					}
-
-					quote! {
-						{
-							use self::#module_name::#type_name;
-							#(#method_items)*
+			let mut index: u32 = 0;
+			for item in body {
+				items.push(match item {
+					DeclItem::Method(method_item) => {
+						let i = gen_method_assertion(index, &module_name, method_item);
+						index += 1;
+						i
+					},
+					DeclItem::Type(type_item) => {
+						let type_name = type_item.ident;
+	
+						let mut method_items = vec![];
+						if let TypeDeclBody::Content((_brace, body)) = type_item.body {
+							for method_item in body {
+								method_items.push(gen_method_assertion(index, &type_name, method_item));
+								index += 1;
+							}
+						}
+	
+						// We use the actual use declaration here to test for the type itself, as it'll fail if it doesn't exist or not exported.
+						// It also makes the codegen easier, because we don't have to qualify the full name type.
+						quote! {
+							{
+								use self::#module_name::#type_name;
+								#(#method_items)*
+							}
 						}
 					}
-				}
-			});
-		}
-
-		let t = quote! {
-			#[allow(dead_code)]
-			fn #load_name() {
-				#(#items)*
+				});
 			}
-		};
-		t.to_tokens(&mut output);
+			let function_name = format!("__load_{}", module_name);
+			let function_name = Ident::new(&function_name, Span::call_site());
+			let t = quote! {
+				#[allow(dead_code)]
+				fn #function_name() {
+					#(#items)*
+				}
+			};
+			t.to_tokens(&mut output);
+		}
 	}
 	output.into()
 }
 
+///
+/// A module declaration: `mod my_mod`
+/// 
+/// The only difference between this and a normal mod is
+/// the ability to add a path literal to attributes:
+/// ```rust
+/// #[cfg(target_os = "windows")] = "my_mod/win/mod.rs"
+/// mod my_mod;
+/// ```
+/// 
 #[derive(Debug)]
 struct ModuleDecl {
-	attrs: Vec<Attribute>,
+	attrs: Vec<(Attribute, Option<LitStr>)>,
 	vis: Visibility,
 	mod_token: Token![mod],
 	ident: Ident,
-	body: Vec<DeclItem>,
+	body: ModuleBody,
+}
+
+#[derive(Debug)]
+enum ModuleBody {
+	Content((token::Brace, Vec<DeclItem>)),
+	Terminated(Token![;]),
 }
 
 impl ModuleDecl {
@@ -134,11 +139,20 @@ impl ModuleDecl {
 
 impl Synom for ModuleDecl {
 	named!(parse -> Self, do_parse!(
-		attrs: many0!(Attribute::parse_outer) >>
+		attrs: many0!(do_parse!(
+			attr: call!(Attribute::parse_outer) >>
+			eq: option!(punct!(=)) >>
+			path: cond!(eq.is_some(), syn!(LitStr))>>
+			(attr, path)
+		)) >>
 		vis: syn!(Visibility) >>
 		mod_token: keyword!(mod) >>
 		ident: syn!(Ident) >>
-		body: map!(braces!(many0!(DeclItem::parse)), |(_brace, vec)| vec) >>
+		body: alt! (
+			punct!(;) => { ModuleBody::Terminated }
+			|
+			braces!(many0!(DeclItem::parse)) => { ModuleBody::Content }
+		) >>
 		(ModuleDecl {
 			attrs,
 			vis,
@@ -161,6 +175,18 @@ enum DeclItem {
 	Type(TypeDecl),
 }
 
+#[derive(Debug)]
+struct TypeDecl {
+	ident: Ident,
+	body: TypeDeclBody,
+}
+
+#[derive(Debug)]
+enum TypeDeclBody {
+	Content((token::Brace, Vec<TraitItemMethod>)),
+	Terminated(Token![;]),
+}
+
 impl DeclItem {
 	named!(parse -> Self, alt!(
 		syn!(TraitItemMethod) => { DeclItem::Method }
@@ -169,23 +195,31 @@ impl DeclItem {
 	));
 }
 
-#[derive(Debug)]
-struct TypeDecl {
-	ident: Ident,
-	body: Vec<TraitItemMethod>,
-}
-
+//Option<Vec<TraitItemMethod>>
 impl Synom for TypeDecl {
 	named!(parse -> Self, do_parse!(
 			_type: keyword!(type) >>
 			ident: syn!(Ident) >>
-			body: map!(braces!(many0!(TraitItemMethod::parse)), |(_brace, vec)| vec) >>
+			body: alt!(
+				punct!(;) => { TypeDeclBody::Terminated }
+				|
+				braces!(many0!(TraitItemMethod::parse)) => { TypeDeclBody::Content }
+			) >>
 			(TypeDecl {
 				ident,
 				body,
 			})
 		)
 	);
+}
+
+fn gen_method_assertion(index: u32, context: &Ident, method_item: TraitItemMethod) -> TokenStream {
+	let load_name = format!("_ASSERT_METHOD_{}", index);
+	let load_ident = Ident::new(&load_name, Span::call_site());
+	let (ty, path) = convert(context, method_item.sig);
+	quote! {
+		const #load_ident: #ty = #path;
+	}
 }
 
 fn convert(context: &Ident, sig: MethodSig) -> (TypeBareFn, ExprPath) {
@@ -270,10 +304,10 @@ fn convert(context: &Ident, sig: MethodSig) -> (TypeBareFn, ExprPath) {
 		let mut values = Punctuated::new();
 		for arg in inputs {
 			let bare_fn_arg = match arg {
-				FnArg::SelfRef(v) => {
+				FnArg::SelfRef(_v) => {
 					continue;
 				}
-				FnArg::SelfValue(v) => {
+				FnArg::SelfValue(_v) => {
 					continue;
 				}
 				FnArg::Captured(ArgCaptured {
@@ -286,10 +320,10 @@ fn convert(context: &Ident, sig: MethodSig) -> (TypeBareFn, ExprPath) {
 						ty
 					}
 				}
-				FnArg::Inferred(v) => {
+				FnArg::Inferred(_v) => {
 					continue;
 				}
-				FnArg::Ignored(v) => {
+				FnArg::Ignored(_v) => {
 					continue;
 				}
 			};
