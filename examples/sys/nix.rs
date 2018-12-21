@@ -1,4 +1,4 @@
-pub fn method(value: u32) -> u8 {
+pub fn method(_: u32) -> u8 {
 	0
 }
 

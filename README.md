@@ -91,7 +91,41 @@ A method assertion is transformed to something like:
 const _VALUE: fn(u32) -> u8 = my_mod::method;
 ```
 
-A type assertion is transformed into a use decl, inside their own scope:
+A method assertion with generics is a bit more complex, but still understandable.
+
+```rust
+fn generic<'a , T: 'a>(_: u32, _: T, _: fn(T) -> T) -> &'a T;
+
+// will turn into into (Note: This is nested inside of the load function itself.)
+
+#[allow(non_snake_case)]
+fn _load_module_name_generic<'a, T: 'a>() {
+	let _VALUE:
+			fn(_: u32, _: T,
+			   _: fn(T) -> T) -> &'a T =
+		other::generic;
+}
+```
+
+It will also transform references to self:
+
+```rust
+mod other {
+	type MyStruct {
+		fn new() -> Self;
+		fn dupe(&self) -> Self;
+		fn clear(&mut self);
+	}
+}
+
+// into
+
+const _VALUE_0: fn() -> MyStruct = MyStruct::new;
+const _VALUE_1: fn(_self: &MyStruct) -> MyStruct = MyStruct::dupe;
+const _VALUE_2: fn(_self: &mut MyStruct) = MyStruct::clear;
+```
+
+A type assertion is transformed into a new scope with a use decl:
 
 ```rust
 {
@@ -110,7 +144,9 @@ def_mod! {
 		fn plus_one(value: u8) -> u8;
 
 		type MyStruct {
-			fn new() -> MyStruct;
+			fn new() -> Self;
+			fn dupe(&self) -> Self;
+			fn clear(&mut self);
 		}
 	}
 }
@@ -123,10 +159,11 @@ mod my_mod;
 
 fn _load_my_mod() {
 	const _ASSERT_METHOD_0: fn(u8) -> u8 = my_mod::method;
-
 	{
 		use self::my_mod::MyStruct;
 		const _ASSERT_METHOD_1: fn() -> MyStruct = MyStruct::new;
+		const _ASSERT_METHOD_2: fn(_self: &MyStruct) -> MyStruct = MyStruct::dupe;
+		const _ASSERT_METHOD_3: fn(_self: &mut MyStruct) -> MyStruct = MyStruct::clear;
 	}
 }
 ```
