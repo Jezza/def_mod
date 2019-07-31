@@ -1,6 +1,6 @@
 /*!
-`def_mod!` provides a familiar syntax to the standard module declarations, but with the added benefit of being able
-to easily define implementation routes and to statically verify module exports.
+`def_mod!` provides a familiar syntax to the standard module declarations, but with the added benefit
+of simpler implementation routing and statically verified module exports.
 
 ---
 ```rust
@@ -14,26 +14,27 @@ def_mod! {
 
 	// Much like the one above, it also has the same effect as Rust's.
 	mod my_first_mod {
-		// It also checks to see if a method with the type `fn(u32) -> u8` was exported.
+		// This will check if a method with the name `method` and type `fn(u32) -> u8` was exported.
     	// It will fail to compile if it finds none.
 		fn method(_: u32) -> u8;
 
 		// Much like the method declaration from above, this will check to see if a type was exported.
 		type MyStruct;
 
-		// This will also check to see if the type `MyOtherStruct` was export.
+		// Much like the normal method check, that functionality is also extended to types.
+		// So you can check if a type has a specific method exported.
 		type MyOtherStruct {
 			// This will check if this method exists on this type. (MyOtherStruct::method)
 			fn method(_: u32) -> u8;
 		}
 	}
 
-	// Attributes are declared like normal.
+	// You can declare attributes like normal.
 	#[cfg(windows)]
 	mod my_second_mod;
 
-	// When declaring an attribute, you can optionally add a path.
-	// This path is then used as the path attribute for the module file.
+	// When declaring an attribute, you can optionally add a string literal.
+	// This literal is used as the path attribute for the module file.
 	// All attributes declared with a path are treated as _mutually exclusive_.
 	// So a `mod` declaration is generated for each.
 	// This makes it a lot easier to manage cross-platform code.
@@ -60,8 +61,8 @@ def_mod! {
 		// This method will only be verified when on linux.
 		#[cfg(linux)]
 		fn interop() -> u8;
-		// Same with this type. It will only be verified when on a linux system
-		#[cfg(linux)]
+		// Same with this type. It will only be verified when on a macos system
+		#[cfg(macos)]
 		type SomeStruct {
 			fn interop() -> u8;
 		}
@@ -75,11 +76,10 @@ fn main() {
 NOTE: that `def_mod` uses syntax tricks to assert for types.  
 So that means when you use the path shorthand, it will still only check the module that is loaded, not all potential modules.    
 
-Eg, if I've got a module that has two possible impls, one for windows and one for unix.  
-If I compile on windows, `def_mod` can't check if the unix module has the correct symbols declared, because it's not the module that's compiled.  
-
-You would need to explicitly enable compilation of the modules you'd want to check, because you can declare  
-arbitrary #[cfg] attributes, there's no way in `def_mod` to do this.  
+One good example is when you have two different modules for specific platforms.  
+The module that would be compiled normally is the only one that would be checked.  
+You would need to explicitly enable compilation of the modules if you want them to be checked too.  
+Because you can declare arbitrary #[cfg] attributes, there's no generic way for `def_mod` to know how to do this.    
 It's entirely up to you.  
 
 ---
@@ -89,10 +89,14 @@ In case you're curious as to what the macro generates:
 A method assertion is transformed to something like:
 
 ```rust
+fn method(_: u32) -> u8;
+
+// into
+
 const _VALUE: fn(u32) -> u8 = my_mod::method;
 ```
 
-A method assertion with generics is a bit more complex, but still understandable.
+A method assertion with generics is a bit more complex:
 
 ```rust
 fn generic<'a , T: 'a>(_: u32, _: T, _: fn(T) -> T) -> &'a T;
@@ -108,27 +112,17 @@ fn _load_module_name_generic<'a, T: 'a>() {
 }
 ```
 
-It will also transform references to self:
+A type assertion is transformed into a new scope with a use declaration:
 
 ```rust
-mod other {
-	type MyStruct {
-		fn new() -> Self;
-		fn dupe(&self) -> Self;
-		fn clear(&mut self);
+def_mod! {
+	mod my_mod {
+		type Test;
 	}
 }
 
-// into
+// Into
 
-const _VALUE_0: fn() -> MyStruct = MyStruct::new;
-const _VALUE_1: fn(_self: &MyStruct) -> MyStruct = MyStruct::dupe;
-const _VALUE_2: fn(_self: &mut MyStruct) = MyStruct::clear;
-```
-
-A type assertion is transformed into a new scope with a use decl:
-
-```rust
 {
 	use self::my_mod::Test;
 	// Any method assertions for the type will also be placed inside the same scope.
@@ -149,6 +143,8 @@ def_mod! {
 			fn dupe(&self) -> Self;
 			fn clear(&mut self);
 		}
+
+		fn generic<'a , T: 'a>(_: u32, _: T, _: fn(T) -> T) -> &'a T;
 	}
 }
 ```
@@ -159,22 +155,36 @@ It'll turn it into something like this:
 mod my_mod;
 
 fn _load_my_mod() {
-	const _ASSERT_METHOD_0: fn(u8) -> u8 = my_mod::method;
+	const _ASSERT_METHOD_0: fn(u8) -> u8 = self::my_mod::plus_one;
 	{
 		use self::my_mod::MyStruct;
 		const _ASSERT_METHOD_1: fn() -> MyStruct = MyStruct::new;
 		const _ASSERT_METHOD_2: fn(_self: &MyStruct) -> MyStruct = MyStruct::dupe;
 		const _ASSERT_METHOD_3: fn(_self: &mut MyStruct) -> MyStruct = MyStruct::clear;
 	}
+	#[allow(non_snake_case)]
+    fn _load_my_mod_generic<'a, T: 'a>() {
+    	let _ASSERT_METHOD_4:
+    			fn(_: u32, _: T,
+    			   _: fn(T) -> T) -> &'a T =
+    		my_mod::generic;
+    }
 }
 ```
 */
 
 #![feature(proc_macro_diagnostic)]
 
+#[macro_use]
 extern crate proc_macro;
+
+#[macro_use]
 extern crate proc_macro2;
+
+#[macro_use]
 extern crate quote;
+
+#[macro_use]
 extern crate syn;
 
 use proc_macro::TokenStream as TStream;
@@ -325,7 +335,7 @@ pub fn def_mod(tokens: TStream) -> TStream {
 /// The body contains methods/types that the module needs to export.
 /// If the module doesn't export those symbols, you will get a compiler error.
 /// 
-#[derive(Debug)]
+#[cfg_attr(feature = "derive-debug", derive(Debug))]
 struct ModuleDecl {
 	attrs: Vec<(Attribute, Option<LitStr>)>,
 	vis: Visibility,
@@ -334,7 +344,7 @@ struct ModuleDecl {
 	body: ModuleBody,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "derive-debug", derive(Debug))]
 enum ModuleBody {
 	Content((token::Brace, Vec<DeclItem>)),
 	Terminated(Token![;]),
@@ -379,20 +389,20 @@ impl ToTokens for ModuleDecl {
 	}
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "derive-debug", derive(Debug))]
 enum DeclItem {
 	Method(TraitItemMethod),
 	Type(TypeDecl),
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "derive-debug", derive(Debug))]
 struct TypeDecl {
 	attrs: Vec<Attribute>,
 	ident: Ident,
 	body: TypeDeclBody,
 }
 
-#[derive(Debug)]
+#[cfg_attr(feature = "derive-debug", derive(Debug))]
 enum TypeDeclBody {
 	Content((token::Brace, Vec<TraitItemMethod>)),
 	Terminated(Token![;]),
